@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+jobs:
+
+  test:
+    name: Test Python services
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements
+        run: |
+          pip install -r gateway/requirements.txt
+          pip install -r auth/requirements.txt
+          pip install -r product/requirements.txt
+          pip install -r order/requirements.txt
+          pip install -r cart/requirements.txt
+
+      - name: Syntax check
+        run: |
+          python -m py_compile gateway/app.py
+          python -m py_compile auth/app.py
+          python -m py_compile product/app.py
+          python -m py_compile order/app.py
+          python -m py_compile cart/app.py
+
+
+  build-and-push:
+    name: Build and push Docker images to ECR
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    needs: test
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        service:
+          - gateway
+          - auth
+          - product
+          - order
+          - cart
+          - frontend
+
+    steps:
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+
+      - name: Check AWS configuration
+        run: |
+          if [ -z "${{ secrets.AWS_ROLE_TO_ASSUME }}" ]; then
+            echo "ERROR: AWS_ROLE_TO_ASSUME secret is not configured."
+            exit 1
+          fi
+
+          if [ -z "$AWS_REGION" ]; then
+            echo "ERROR: AWS_REGION secret is not configured."
+            exit 1
+          fi
+
+          if [ -z "$AWS_ACCOUNT_ID" ]; then
+            echo "ERROR: AWS_ACCOUNT_ID secret is not configured."
+            exit 1
+          fi
+
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password \
+            --region "$AWS_REGION" |
+            docker login \
+            --username AWS \
+            --password-stdin \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+
+      - name: Build Docker image
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -e
+
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          ECR_REPOSITORY="microservices-1"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+
+          echo "Building Docker image for $SERVICE"
+
+          docker build \
+            -t "$IMAGE:$SERVICE" \
+            "./$SERVICE"
+
+
+      - name: Tag Docker image
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -e
+
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          ECR_REPOSITORY="microservices-1"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+
+          docker tag \
+            "$IMAGE:$SERVICE" \
+            "$IMAGE:${GITHUB_SHA}-$SERVICE"
+
+
+      - name: Push Docker image
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -e
+
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          ECR_REPOSITORY="microservices-1"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+
+          echo "Pushing image:"
+          echo "$IMAGE:$SERVICE"
+
+          docker push \
+            "$IMAGE:$SERVICE"
+
+          echo "Pushing commit image:"
+          echo "$IMAGE:${GITHUB_SHA}-$SERVICE"
+
+          docker push \
+            "$IMAGE:${GITHUB_SHA}-$SERVICE"
+
+
+      - name: Display image information
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          ECR_REGISTRY="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          ECR_REPOSITORY="microservices-1"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+
+          echo "=========================================="
+          echo "Service: $SERVICE"
+          echo "=========================================="
+          echo "Image:"
+          echo "$IMAGE:$SERVICE"
+          echo ""
+          echo "Commit Image:"
+          echo "$IMAGE:${GITHUB_SHA}-$SERVICE"
+          echo ""
+          echo "Git Commit:"
+          echo "$GITHUB_SHA"
+          echo "=========================================="
